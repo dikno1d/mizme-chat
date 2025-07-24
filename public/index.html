@@ -1133,6 +1133,13 @@
 
         .voice-participant.active-speaker {
             box-shadow: 0 0 0 2px var(--primary);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(67, 97, 238, 0.7); }
+            70% { box-shadow: 0 0 0 10px rgba(67, 97, 238, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(67, 97, 238, 0); }
         }
 
         .voice-participant-avatar {
@@ -2095,6 +2102,7 @@
         let voiceParticipants = {};
         let videoParticipants = {};
         let voiceChatCollapsed = false;
+        let activeSpeaker = null;
 
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
@@ -3031,7 +3039,14 @@
         async function joinVoiceChat() {
             try {
                 // Request microphone access
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    },
+                    video: false
+                });
                 localStream = stream;
                 
                 // Initialize voice chat UI
@@ -3078,6 +3093,7 @@
             voiceChatActive = false;
             voiceParticipantsEl.innerHTML = '';
             voiceParticipants = {};
+            activeSpeaker = null;
             
             // Update button state
             voiceChatBtn.innerHTML = '<i class="fas fa-phone-alt"></i><span class="tooltip top">Voice Chat</span>';
@@ -3113,6 +3129,10 @@
             
             delete voiceParticipants[participantId];
             document.querySelector(`.voice-participant[data-id="${participantId}"]`)?.remove();
+            
+            if (activeSpeaker === participantId) {
+                activeSpeaker = null;
+            }
         }
 
         function updateVoiceParticipant(participantId, state) {
@@ -3145,7 +3165,18 @@
         async function joinVideoChat() {
             try {
                 // Request camera and microphone access
-                const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: {
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 },
+                        facingMode: 'user'
+                    }, 
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
                 localStream = stream;
                 
                 // Initialize video chat UI
@@ -3260,7 +3291,45 @@
                     // Just play the audio
                     const audio = new Audio();
                     audio.srcObject = stream;
-                    audio.play();
+                    audio.play().catch(e => console.error('Error playing audio:', e));
+                    
+                    // Detect active speaker
+                    const audioContext = new AudioContext();
+                    const analyser = audioContext.createAnalyser();
+                    const source = audioContext.createMediaStreamSource(stream);
+                    source.connect(analyser);
+                    
+                    const checkVolume = () => {
+                        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+                        analyser.getByteFrequencyData(dataArray);
+                        
+                        const volume = dataArray.reduce((sum, value) => sum + value, 0) / dataArray.length;
+                        
+                        if (volume > 10 && activeSpeaker !== targetId) {
+                            activeSpeaker = targetId;
+                            
+                            // Update UI to show active speaker
+                            document.querySelectorAll('.voice-participant').forEach(el => {
+                                el.classList.remove('active-speaker');
+                            });
+                            
+                            const participantEl = document.querySelector(`.voice-participant[data-id="${targetId}"]`);
+                            if (participantEl) {
+                                participantEl.classList.add('active-speaker');
+                            }
+                        } else if (volume <= 10 && activeSpeaker === targetId) {
+                            activeSpeaker = null;
+                            document.querySelector(`.voice-participant[data-id="${targetId}"]`)?.classList.remove('active-speaker');
+                        }
+                        
+                        if (voiceChatActive) {
+                            requestAnimationFrame(checkVolume);
+                        }
+                    };
+                    
+                    audioContext.resume().then(() => {
+                        checkVolume();
+                    });
                 } else if (videoChatActive) {
                     // For video chat, display the stream
                     addVideoStream(targetId, stream, voiceParticipants[targetId]?.username || 'Unknown');
@@ -3270,10 +3339,17 @@
             // ICE candidate handling
             pc.onicecandidate = (event) => {
                 if (event.candidate) {
-                    socket.emit('voiceIceCandidate', {
-                        target: targetId,
-                        candidate: event.candidate
-                    });
+                    if (voiceChatActive) {
+                        socket.emit('voiceIceCandidate', {
+                            target: targetId,
+                            candidate: event.candidate
+                        });
+                    } else if (videoChatActive) {
+                        socket.emit('videoIceCandidate', {
+                            target: targetId,
+                            candidate: event.candidate
+                        });
+                    }
                 }
             };
             
@@ -3305,7 +3381,15 @@
         voiceDeafenBtn.addEventListener('click', () => {
             isDeafened = !isDeafened;
             
-            // In a real app, you would mute all incoming audio
+            // Mute all incoming audio
+            Object.values(peerConnections).forEach(pc => {
+                pc.getReceivers().forEach(receiver => {
+                    if (receiver.track.kind === 'audio') {
+                        receiver.track.enabled = !isDeafened;
+                    }
+                });
+            });
+            
             voiceDeafenBtn.classList.toggle('deafened', isDeafened);
             voiceDeafenBtn.innerHTML = `<i class="fas ${isDeafened ? 'fa-volume-mute' : 'fa-volume-up'}"></i>`;
             
