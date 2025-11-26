@@ -2,415 +2,142 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const path = require('path');
-const cors = require('cors');
 
-// Initialize Express app
 const app = express();
-app.use(cors());
-app.use(express.json());
-
-// Create HTTP server
 const server = http.createServer(app);
-
-// Configure Socket.IO with enhanced settings
 const io = socketIo(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"]
-  },
-  transports: ['websocket', 'polling'],
-  upgrade: false,
-  pingTimeout: 30000,
-  pingInterval: 5000,
-  maxHttpBufferSize: 1e8 // 100MB max payload size for file transfers
+  }
 });
 
 // Serve static files
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Store application state
-const state = {
-  users: {},
-  rooms: {
-    'general': { users: {}, userCount: 0 },
-    'gaming': { users: {}, userCount: 0 },
-    'random': { users: {}, userCount: 0 }
-  },
-  voiceParticipants: {},
-  videoParticipants: {},
-  roomInfo: {
-    'general': { name: 'General', description: 'General discussions', icon: 'fa-hashtag' },
-    'gaming': { name: 'Gaming', description: 'All about games', icon: 'fa-gamepad' },
-    'random': { name: 'Random', description: 'Anything goes', icon: 'fa-random' }
-  }
-};
+// Store active users and rooms
+const users = new Map();
+const rooms = new Map();
+const voiceRooms = new Map();
+const videoRooms = new Map();
 
-// Helper functions
-function updateRoomUserCount(roomId) {
-  state.rooms[roomId].userCount = Object.keys(state.rooms[roomId].users).length;
-  return state.rooms[roomId].userCount;
-}
+// Initialize default rooms
+rooms.set('general', { name: 'General', description: 'General discussions', users: new Set() });
+rooms.set('gaming', { name: 'Gaming', description: 'All about games', users: new Set() });
+rooms.set('random', { name: 'Random', description: 'Anything goes', users: new Set() });
 
-function broadcastUserList(roomId) {
-  const usersInRoom = Object.values(state.rooms[roomId].users);
-  
-  io.to(roomId).emit('updateUsers', {
-    users: usersInRoom.map(u => ({
-      username: u.username,
-      status: u.status,
-      avatarColor: u.avatarColor
-    })),
-    count: state.rooms[roomId].userCount,
-    room: roomId
-  });
-}
+// Initialize voice and video rooms
+voiceRooms.set('general', new Set());
+voiceRooms.set('gaming', new Set());
+voiceRooms.set('random', new Set());
 
-function cleanupUser(socketId) {
-  const user = state.users[socketId];
-  if (!user) return;
+videoRooms.set('general', new Set());
+videoRooms.set('gaming', new Set());
+videoRooms.set('random', new Set());
 
-  // Remove from room
-  if (state.rooms[user.room]) {
-    delete state.rooms[user.room].users[socketId];
-    updateRoomUserCount(user.room);
-    broadcastUserList(user.room);
-  }
-
-  // Remove from voice chat if active
-  if (state.voiceParticipants[socketId]) {
-    const voiceRoom = state.voiceParticipants[socketId].room;
-    delete state.voiceParticipants[socketId];
-    io.to(voiceRoom).emit('voiceUserLeft', socketId);
-  }
-
-  // Remove from video chat if active
-  if (state.videoParticipants[socketId]) {
-    const videoRoom = state.videoParticipants[socketId].room;
-    delete state.videoParticipants[socketId];
-    io.to(videoRoom).emit('videoUserLeft', socketId);
-  }
-
-  // Remove from main users list
-  delete state.users[socketId];
-}
-
-// Socket.IO connection handler
 io.on('connection', (socket) => {
-  console.log(`New connection: ${socket.id}`);
+  console.log('User connected:', socket.id);
 
-  // Join room handler
-  socket.on('join', (data, callback) => {
+  socket.on('join', (userData) => {
     try {
-      const { username, room, avatarColor } = data;
+      const { username, room, avatarColor } = userData;
       
-      // Validate input
-      if (!username || !room || !state.rooms[room]) {
-        throw new Error('Invalid join data');
-      }
-
-      // Cleanup previous session if reconnecting
-      if (state.users[socket.id]) {
-        cleanupUser(socket.id);
-      }
-
-      // Create user object
-      state.users[socket.id] = {
+      // Store user info
+      users.set(socket.id, {
         id: socket.id,
         username,
         room,
-        avatarColor: avatarColor || '#4361ee',
-        status: 'online',
-        joinedAt: new Date()
-      };
+        avatarColor,
+        status: 'online'
+      });
 
-      // Add to room
-      state.rooms[room].users[socket.id] = state.users[socket.id];
-      updateRoomUserCount(room);
+      // Leave previous room if any
+      if (socket.room) {
+        socket.leave(socket.room);
+        const oldRoom = rooms.get(socket.room);
+        if (oldRoom) {
+          oldRoom.users.delete(socket.id);
+        }
+      }
 
-      // Join socket room
+      // Join new room
       socket.join(room);
+      socket.room = room;
 
-      // Notify room
-      io.to(room).emit('message', {
+      const roomData = rooms.get(room);
+      if (roomData) {
+        roomData.users.add(socket.id);
+      }
+
+      // Notify room about new user
+      socket.to(room).emit('message', {
         user: 'System',
-        text: `${username} has joined ${room}`,
-        timestamp: new Date().toISOString(),
+        text: `${username} joined the room`,
+        timestamp: new Date(),
         isSystem: true
       });
 
-      // Send room info to the user
-      const roomData = {
-        ...state.roomInfo[room],
-        userCount: state.rooms[room].userCount
-      };
-
-      // Send user list to everyone in the room
-      broadcastUserList(room);
-
-      // Send success response
-      if (callback) {
-        callback({
-          success: true,
-          room: roomData,
-          user: state.users[socket.id]
-        });
-      }
-
-      console.log(`${username} joined ${room}`);
-    } catch (error) {
-      console.error('Join error:', error);
-      if (callback) {
-        callback({
-          success: false,
-          error: error.message
-        });
-      }
-    }
-  });
-
-  // Message handler
-  socket.on('sendMessage', (data) => {
-    try {
-      const user = state.users[socket.id];
-      if (!user || !data || !data.message) return;
-
-      const messageData = {
-        user: user.username,
-        text: data.message,
-        timestamp: new Date().toISOString(),
-        isImage: data.isImage || false,
-        isSystem: false,
-        isAction: data.isAction || false,
-        avatarColor: user.avatarColor
-      };
-
-      io.to(user.room).emit('message', messageData);
-    } catch (error) {
-      console.error('Message send error:', error);
-    }
-  });
-
-  // Voice chat handlers
-  socket.on('joinVoiceChat', (room) => {
-    try {
-      const user = state.users[socket.id];
-      if (!user) return;
-
-      // Add to voice participants
-      state.voiceParticipants[socket.id] = {
-        id: socket.id,
-        username: user.username,
-        room,
-        isMuted: false,
-        isDeafened: false,
-        avatarColor: user.avatarColor
-      };
-
-      // Notify room
-      socket.to(room).emit('voiceUserJoined', state.voiceParticipants[socket.id]);
-
-      // Send current participants to the new user
-      const participants = Object.values(state.voiceParticipants)
-        .filter(p => p.room === room && p.id !== socket.id);
+      // Send updated user list
+      updateRoomUsers(room);
       
-      socket.emit('voiceChatUsers', participants);
-
-      console.log(`${user.username} joined voice chat in ${room}`);
-    } catch (error) {
-      console.error('Voice chat join error:', error);
-    }
-  });
-
-  socket.on('leaveVoiceChat', () => {
-    try {
-      if (!state.voiceParticipants[socket.id]) return;
-
-      const room = state.voiceParticipants[socket.id].room;
-      delete state.voiceParticipants[socket.id];
-
-      // Notify room
-      socket.to(room).emit('voiceUserLeft', socket.id);
-
-      console.log(`User left voice chat in ${room}`);
-    } catch (error) {
-      console.error('Voice chat leave error:', error);
-    }
-  });
-
-  // WebRTC signaling handlers
-  socket.on('voiceOffer', ({ target, offer }) => {
-    try {
-      if (state.voiceParticipants[target]) {
-        io.to(target).emit('voiceOffer', {
-          from: socket.id,
-          offer
-        });
-      }
-    } catch (error) {
-      console.error('Voice offer error:', error);
-    }
-  });
-
-  socket.on('voiceAnswer', ({ target, answer }) => {
-    try {
-      if (state.voiceParticipants[target]) {
-        io.to(target).emit('voiceAnswer', {
-          from: socket.id,
-          answer
-        });
-      }
-    } catch (error) {
-      console.error('Voice answer error:', error);
-    }
-  });
-
-  socket.on('voiceIceCandidate', ({ target, candidate }) => {
-    try {
-      if (state.voiceParticipants[target]) {
-        io.to(target).emit('voiceIceCandidate', {
-          from: socket.id,
-          candidate
-        });
-      }
-    } catch (error) {
-      console.error('Voice ICE candidate error:', error);
-    }
-  });
-
-  socket.on('voiceStateChange', ({ isMuted, isDeafened }) => {
-    try {
-      if (!state.voiceParticipants[socket.id]) return;
-
-      state.voiceParticipants[socket.id].isMuted = isMuted;
-      state.voiceParticipants[socket.id].isDeafened = isDeafened;
-
-      // Notify room
-      socket.to(state.voiceParticipants[socket.id].room).emit('voiceStateChanged', {
-        userId: socket.id,
-        isMuted,
-        isDeafened
+      // Send welcome message to the user
+      socket.emit('message', {
+        user: 'System',
+        text: `Welcome to ${roomData?.name || room}, ${username}!`,
+        timestamp: new Date(),
+        isSystem: true
       });
+
     } catch (error) {
-      console.error('Voice state change error:', error);
+      console.error('Error in join:', error);
+      socket.emit('error', { message: 'Failed to join room' });
     }
   });
 
-  // Video chat handlers
-  socket.on('joinVideoChat', (room) => {
+  socket.on('sendMessage', (messageData) => {
     try {
-      const user = state.users[socket.id];
+      const user = users.get(socket.id);
       if (!user) return;
 
-      // Add to video participants
-      state.videoParticipants[socket.id] = {
-        id: socket.id,
-        username: user.username,
-        room,
-        avatarColor: user.avatarColor
+      const message = {
+        user: user.username,
+        text: messageData.message,
+        isImage: messageData.isImage || false,
+        isAction: messageData.isAction || false,
+        timestamp: new Date(),
+        reactions: []
       };
 
-      // Notify room
-      socket.to(room).emit('videoUserJoined', state.videoParticipants[socket.id]);
+      // Broadcast to room
+      io.to(user.room).emit('message', message);
 
-      // Send current participants to the new user
-      const participants = Object.values(state.videoParticipants)
-        .filter(p => p.room === room && p.id !== socket.id);
-      
-      socket.emit('videoChatUsers', participants);
-
-      console.log(`${user.username} joined video chat in ${room}`);
     } catch (error) {
-      console.error('Video chat join error:', error);
+      console.error('Error in sendMessage:', error);
+      socket.emit('error', { message: 'Failed to send message' });
     }
   });
 
-  socket.on('leaveVideoChat', () => {
-    try {
-      if (!state.videoParticipants[socket.id]) return;
-
-      const room = state.videoParticipants[socket.id].room;
-      delete state.videoParticipants[socket.id];
-
-      // Notify room
-      socket.to(room).emit('videoUserLeft', socket.id);
-
-      console.log(`User left video chat in ${room}`);
-    } catch (error) {
-      console.error('Video chat leave error:', error);
+  socket.on('typing', () => {
+    const user = users.get(socket.id);
+    if (user) {
+      socket.to(user.room).emit('typing', { username: user.username });
     }
   });
 
-  // Video WebRTC signaling handlers
-  socket.on('videoOffer', ({ target, offer }) => {
-    try {
-      if (state.videoParticipants[target]) {
-        io.to(target).emit('videoOffer', {
-          from: socket.id,
-          offer
-        });
-      }
-    } catch (error) {
-      console.error('Video offer error:', error);
+  socket.on('stopTyping', () => {
+    const user = users.get(socket.id);
+    if (user) {
+      socket.to(user.room).emit('stopTyping', { username: user.username });
     }
   });
 
-  socket.on('videoAnswer', ({ target, answer }) => {
-    try {
-      if (state.videoParticipants[target]) {
-        io.to(target).emit('videoAnswer', {
-          from: socket.id,
-          answer
-        });
-      }
-    } catch (error) {
-      console.error('Video answer error:', error);
-    }
-  });
-
-  socket.on('videoIceCandidate', ({ target, candidate }) => {
-    try {
-      if (state.videoParticipants[target]) {
-        io.to(target).emit('videoIceCandidate', {
-          from: socket.id,
-          candidate
-        });
-      }
-    } catch (error) {
-      console.error('Video ICE candidate error:', error);
-    }
-  });
-
-  // User status and info handlers
   socket.on('changeUsername', (newUsername) => {
     try {
-      const user = state.users[socket.id];
+      const user = users.get(socket.id);
       if (!user) return;
 
       const oldUsername = user.username;
       user.username = newUsername;
-
-      // Update in rooms
-      if (state.rooms[user.room]) {
-        state.rooms[user.room].users[socket.id].username = newUsername;
-      }
-
-      // Update in voice chat if active
-      if (state.voiceParticipants[socket.id]) {
-        state.voiceParticipants[socket.id].username = newUsername;
-        socket.to(state.voiceParticipants[socket.id].room).emit('voiceUserUpdated', {
-          id: socket.id,
-          username: newUsername
-        });
-      }
-
-      // Update in video chat if active
-      if (state.videoParticipants[socket.id]) {
-        state.videoParticipants[socket.id].username = newUsername;
-        socket.to(state.videoParticipants[socket.id].room).emit('videoUserUpdated', {
-          id: socket.id,
-          username: newUsername
-        });
-      }
 
       // Notify room
       io.to(user.room).emit('userChangedUsername', {
@@ -418,129 +145,263 @@ io.on('connection', (socket) => {
         newUsername
       });
 
-      // Update user list
-      broadcastUserList(user.room);
+      updateRoomUsers(user.room);
 
-      console.log(`${oldUsername} changed username to ${newUsername}`);
     } catch (error) {
-      console.error('Username change error:', error);
+      console.error('Error in changeUsername:', error);
+      socket.emit('error', { message: 'Failed to change username' });
     }
   });
 
   socket.on('setStatus', (status) => {
-    try {
-      const user = state.users[socket.id];
-      if (!user || !['online', 'away', 'offline'].includes(status)) return;
-
+    const user = users.get(socket.id);
+    if (user && ['online', 'away', 'offline'].includes(status)) {
       user.status = status;
-
-      // Update in rooms
-      if (state.rooms[user.room]) {
-        state.rooms[user.room].users[socket.id].status = status;
-      }
-
-      // Notify room
-      io.to(user.room).emit('userStatusChanged', {
-        username: user.username,
-        status
-      });
-
-      // Update user list
-      broadcastUserList(user.room);
-
-      console.log(`${user.username} status changed to ${status}`);
-    } catch (error) {
-      console.error('Status change error:', error);
+      updateRoomUsers(user.room);
     }
   });
 
-  // Typing indicators
-  socket.on('typing', () => {
-    const user = state.users[socket.id];
+  socket.on('getUsers', () => {
+    const user = users.get(socket.id);
     if (user) {
-      socket.to(user.room).emit('typing', {
-        username: user.username,
-        room: user.room
-      });
+      updateRoomUsers(user.room);
     }
   });
 
-  socket.on('stopTyping', () => {
-    const user = state.users[socket.id];
-    if (user) {
-      socket.to(user.room).emit('stopTyping', user.username);
-    }
-  });
-
-  // Disconnect handler
-  socket.on('disconnect', () => {
+  // Voice Chat Events
+  socket.on('joinVoiceChat', (room) => {
     try {
-      const user = state.users[socket.id];
+      const user = users.get(socket.id);
       if (!user) return;
 
-      console.log(`${user.username} disconnected`);
+      const voiceRoom = voiceRooms.get(room) || new Set();
+      voiceRoom.add(socket.id);
+      voiceRooms.set(room, voiceRoom);
 
-      // Notify room
-      io.to(user.room).emit('message', {
-        user: 'System',
-        text: `${user.username} has left`,
-        timestamp: new Date().toISOString(),
-        isSystem: true
-      });
+      // Get current voice chat participants
+      const participants = Array.from(voiceRoom)
+        .map(id => {
+          const u = users.get(id);
+          return u ? { id: u.id, username: u.username, isMuted: false, isDeafened: false } : null;
+        })
+        .filter(Boolean);
 
-      // Notify status change
-      io.to(user.room).emit('userStatusChanged', {
+      // Notify existing participants about new user
+      socket.to(room).emit('voiceUserJoined', {
+        id: socket.id,
         username: user.username,
-        status: 'offline'
+        isMuted: false,
+        isDeafened: false
       });
 
-      // Cleanup user data
-      cleanupUser(socket.id);
+      // Send current participants to the new user
+      socket.emit('voiceChatUsers', participants);
+
+      console.log(`User ${user.username} joined voice chat in room ${room}`);
+
     } catch (error) {
-      console.error('Disconnect error:', error);
+      console.error('Error in joinVoiceChat:', error);
+      socket.emit('error', { message: 'Failed to join voice chat' });
     }
   });
 
-  // Error handler
-  socket.on('error', (error) => {
-    console.error('Socket error:', error);
+  socket.on('leaveVoiceChat', () => {
+    try {
+      const user = users.get(socket.id);
+      if (!user) return;
+
+      const voiceRoom = voiceRooms.get(user.room);
+      if (voiceRoom) {
+        voiceRoom.delete(socket.id);
+      }
+
+      // Notify other participants
+      socket.to(user.room).emit('voiceUserLeft', socket.id);
+
+      console.log(`User ${user.username} left voice chat`);
+
+    } catch (error) {
+      console.error('Error in leaveVoiceChat:', error);
+    }
   });
+
+  socket.on('voiceStateChange', (state) => {
+    const user = users.get(socket.id);
+    if (user) {
+      socket.to(user.room).emit('voiceStateChanged', {
+        userId: socket.id,
+        isMuted: state.isMuted,
+        isDeafened: state.isDeafened
+      });
+    }
+  });
+
+  // WebRTC Signaling for Voice
+  socket.on('voiceOffer', (data) => {
+    socket.to(data.target).emit('voiceOffer', {
+      from: socket.id,
+      offer: data.offer
+    });
+  });
+
+  socket.on('voiceAnswer', (data) => {
+    socket.to(data.target).emit('voiceAnswer', {
+      from: socket.id,
+      answer: data.answer
+    });
+  });
+
+  socket.on('voiceIceCandidate', (data) => {
+    socket.to(data.target).emit('voiceIceCandidate', {
+      from: socket.id,
+      candidate: data.candidate
+    });
+  });
+
+  // Video Chat Events
+  socket.on('joinVideoChat', (room) => {
+    try {
+      const user = users.get(socket.id);
+      if (!user) return;
+
+      const videoRoom = videoRooms.get(room) || new Set();
+      videoRoom.add(socket.id);
+      videoRooms.set(room, videoRoom);
+
+      // Notify existing participants about new user
+      socket.to(room).emit('videoUserJoined', {
+        id: socket.id,
+        username: user.username
+      });
+
+      console.log(`User ${user.username} joined video chat in room ${room}`);
+
+    } catch (error) {
+      console.error('Error in joinVideoChat:', error);
+      socket.emit('error', { message: 'Failed to join video chat' });
+    }
+  });
+
+  socket.on('leaveVideoChat', () => {
+    try {
+      const user = users.get(socket.id);
+      if (!user) return;
+
+      const videoRoom = videoRooms.get(user.room);
+      if (videoRoom) {
+        videoRoom.delete(socket.id);
+      }
+
+      // Notify other participants
+      socket.to(user.room).emit('videoUserLeft', socket.id);
+
+      console.log(`User ${user.username} left video chat`);
+
+    } catch (error) {
+      console.error('Error in leaveVideoChat:', error);
+    }
+  });
+
+  // WebRTC Signaling for Video
+  socket.on('videoOffer', (data) => {
+    socket.to(data.target).emit('videoOffer', {
+      from: socket.id,
+      offer: data.offer
+    });
+  });
+
+  socket.on('videoAnswer', (data) => {
+    socket.to(data.target).emit('videoAnswer', {
+      from: socket.id,
+      answer: data.answer
+    });
+  });
+
+  socket.on('videoIceCandidate', (data) => {
+    socket.to(data.target).emit('videoIceCandidate', {
+      from: socket.id,
+      candidate: data.candidate
+    });
+  });
+
+  socket.on('disconnect', () => {
+    try {
+      const user = users.get(socket.id);
+      if (user) {
+        // Leave voice chat
+        const voiceRoom = voiceRooms.get(user.room);
+        if (voiceRoom) {
+          voiceRoom.delete(socket.id);
+          socket.to(user.room).emit('voiceUserLeft', socket.id);
+        }
+
+        // Leave video chat
+        const videoRoom = videoRooms.get(user.room);
+        if (videoRoom) {
+          videoRoom.delete(socket.id);
+          socket.to(user.room).emit('videoUserLeft', socket.id);
+        }
+
+        // Leave text chat room
+        const roomData = rooms.get(user.room);
+        if (roomData) {
+          roomData.users.delete(socket.id);
+          
+          // Notify room about user leaving
+          socket.to(user.room).emit('message', {
+            user: 'System',
+            text: `${user.username} left the room`,
+            timestamp: new Date(),
+            isSystem: true
+          });
+
+          updateRoomUsers(user.room);
+        }
+
+        users.delete(socket.id);
+        console.log('User disconnected:', socket.id);
+      }
+    } catch (error) {
+      console.error('Error in disconnect:', error);
+    }
+  });
+
+  function updateRoomUsers(room) {
+    const roomData = rooms.get(room);
+    if (!roomData) return;
+
+    const roomUsers = Array.from(roomData.users)
+      .map(id => {
+        const user = users.get(id);
+        return user ? { 
+          username: user.username, 
+          status: user.status,
+          avatarColor: user.avatarColor
+        } : null;
+      })
+      .filter(Boolean);
+
+    io.to(room).emit('updateUsers', {
+      room,
+      users: roomUsers,
+      count: roomUsers.length
+    });
+  }
 });
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.status(200).json({
-    status: 'healthy',
-    users: Object.keys(state.users).length,
-    voiceParticipants: Object.keys(state.voiceParticipants).length,
-    videoParticipants: Object.keys(state.videoParticipants).length,
-    rooms: Object.keys(state.rooms).map(roomId => ({
-      id: roomId,
-      name: state.roomInfo[roomId]?.name || roomId,
-      userCount: state.rooms[roomId].userCount
-    }))
-  });
+// Send room list to clients
+app.get('/api/rooms', (req, res) => {
+  const roomList = Array.from(rooms.entries()).map(([id, room]) => ({
+    id,
+    name: room.name,
+    description: room.description,
+    userCount: room.users.size
+  }));
+  res.json(roomList);
 });
 
-// Start server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-});
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received. Shutting down gracefully...');
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
-});
-
-process.on('SIGINT', () => {
-  console.log('SIGINT received. Shutting down gracefully...');
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
+  console.log(`Voice and video chat enabled with WebRTC`);
 });
